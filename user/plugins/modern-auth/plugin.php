@@ -181,6 +181,13 @@ function modern_auth_validate_registration( $username, $email, $password ) {
     if ( modern_auth_get_user( $username ) ) {
         return yourls__( 'This username is already taken.' );
     }
+    // Reject usernames that collide with a config.php admin: config auth wins at login, so such
+    // an account could never actually log in, and it would share an owner identity (and thus link
+    // ownership) with that admin. Keep owner identities unambiguous.
+    $config_admins = array_keys( (array) ( $GLOBALS['yourls_user_passwords'] ?? [] ) );
+    if ( in_array( $username, $config_admins, true ) ) {
+        return yourls__( 'This username is not available.' );
+    }
     return '';
 }
 
@@ -726,6 +733,12 @@ function modern_auth_register_users_page() {
 }
 
 function modern_auth_users_page() {
+    // Defense in depth: this page is reached via plugins.php, which the auth_successful guard
+    // already restricts to config admins -- but never render user management for anyone else.
+    if ( !modern_auth_is_config_admin() ) {
+        yourls_die( yourls__( 'You do not have permission to access this page.' ), yourls__( 'Access denied' ), 403 );
+    }
+
     $notice = '';
 
     if ( isset( $_GET['delete'], $_GET['id'] ) ) {
@@ -776,4 +789,312 @@ function modern_auth_users_page() {
     }
 
     echo '</tbody></table></div>';
+}
+
+/**
+ * ===========================================================================
+ * Per-user link ownership (full isolation).
+ *
+ * YOURLS core keeps all short links in one table with no notion of "who created
+ * this link", so with multi-user login enabled every logged-in user could see,
+ * edit and delete every other user's links. This section records an owner for
+ * each link and scopes all management operations to the current user:
+ *   - the admin links list only shows your own links
+ *   - edit / delete / edit-form / stats-page are blocked for links you don't own
+ *   - the "does this long URL already exist" check is scoped to your own links,
+ *     so two users shortening the same URL each get their own short link
+ *   - the dashboard/overview counts reflect only your own links
+ *
+ * Public short-URL *redirects* are deliberately NOT restricted -- a short link
+ * must resolve for anyone who clicks it, that's the whole point.
+ *
+ * Ownership is stored in a side table (keyword -> owner username) rather than by
+ * altering the core url table, so nothing in core needs to change. "owner" is
+ * the YOURLS_USER string, which is set uniformly for both config.php admins and
+ * DB-registered users.
+ * ===========================================================================
+ */
+
+define( 'MODERN_AUTH_OWNERS_TABLE', YOURLS_DB_PREFIX . 'link_owners' );
+
+/**
+ * Create the ownership table once, and backfill: every pre-existing link that has
+ * no owner yet is assigned to the first admin defined in config.php. Uses its own
+ * ready-flag so it still runs on installs where the users table already existed.
+ */
+yourls_add_action( 'plugins_loaded', 'modern_auth_maybe_create_owners_table' );
+function modern_auth_maybe_create_owners_table() {
+    if ( yourls_get_option( 'modern_auth_owners_ready' ) ) {
+        return;
+    }
+
+    $table     = MODERN_AUTH_OWNERS_TABLE;
+    $url_table = YOURLS_DB_TABLE_URL;
+    $pdo = yourls_get_db('write-modern_auth_create_owners')->getPdo();
+
+    // keyword collation matches the core url table (utf8mb4_bin) so the IN (...) subqueries
+    // below compare and index correctly.
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `$table` (
+            `keyword` VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            `owner` VARCHAR(190) NOT NULL,
+            PRIMARY KEY (`keyword`),
+            KEY `owner` (`owner`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+    );
+
+    $admin = modern_auth_first_config_admin();
+    if ( $admin !== null && $admin !== '' ) {
+        $stmt = $pdo->prepare(
+            "INSERT IGNORE INTO `$table` (`keyword`, `owner`)
+             SELECT u.`keyword`, :admin FROM `$url_table` u
+             LEFT JOIN `$table` o ON o.`keyword` = u.`keyword`
+             WHERE o.`keyword` IS NULL"
+        );
+        $stmt->execute( [ 'admin' => $admin ] );
+    }
+
+    yourls_update_option( 'modern_auth_owners_ready', true );
+}
+
+/**
+ * @return string|null first username defined in config.php's $yourls_user_passwords, or null
+ */
+function modern_auth_first_config_admin() {
+    $users = $GLOBALS['yourls_user_passwords'] ?? [];
+    if ( !is_array( $users ) || !$users ) {
+        return null;
+    }
+    return (string) array_key_first( $users );
+}
+
+/**
+ * @return string|null the current logged-in username, or null if none
+ */
+function modern_auth_current_owner() {
+    return defined( 'YOURLS_USER' ) ? (string) YOURLS_USER : null;
+}
+
+/**
+ * @param string $keyword
+ * @return bool whether the current user owns this keyword. Fails closed: unknown/un-owned
+ *              keywords and anonymous requests return false.
+ */
+function modern_auth_owns_keyword( $keyword ) {
+    $owner = modern_auth_current_owner();
+    if ( $owner === null ) {
+        return false;
+    }
+    $table = MODERN_AUTH_OWNERS_TABLE;
+    $found = yourls_get_db('read-modern_auth_owns')->fetchValue(
+        "SELECT `owner` FROM `$table` WHERE `keyword` = :keyword LIMIT 1",
+        [ 'keyword' => yourls_sanitize_keyword( $keyword ) ]
+    );
+    return ( $found !== false && $found !== null && (string) $found === $owner );
+}
+
+/**
+ * Record ownership when a link is created. insert_link fires as
+ * do_action('insert_link', $success, $url, $keyword, $title, $timestamp, $ip); YOURLS passes
+ * all action arguments to callbacks as a single array (see note on modern_auth_admin_assets).
+ */
+yourls_add_action( 'insert_link', 'modern_auth_record_owner' );
+function modern_auth_record_owner( $args ) {
+    if ( !is_array( $args ) ) {
+        return;
+    }
+    $success = $args[0] ?? false;
+    $keyword = $args[2] ?? '';
+    if ( !$success || $keyword === '' || !defined( 'YOURLS_USER' ) ) {
+        return;
+    }
+    $table = MODERN_AUTH_OWNERS_TABLE;
+    yourls_get_db('write-modern_auth_record_owner')->fetchAffected(
+        "REPLACE INTO `$table` (`keyword`, `owner`) VALUES (:keyword, :owner)",
+        [ 'keyword' => $keyword, 'owner' => YOURLS_USER ]
+    );
+}
+
+/**
+ * Restrict the admin links list to the current user's own links.
+ */
+yourls_add_filter( 'admin_list_where', 'modern_auth_filter_list_by_owner' );
+function modern_auth_filter_list_by_owner( $where ) {
+    $owner = modern_auth_current_owner();
+    if ( $owner === null ) {
+        $where['sql'] .= ' AND 1=0';
+        return $where;
+    }
+    $table = MODERN_AUTH_OWNERS_TABLE;
+    $where['sql'] .= " AND `keyword` IN (SELECT `keyword` FROM `$table` WHERE `owner` = :modern_auth_owner)";
+    $where['binds']['modern_auth_owner'] = $owner;
+    return $where;
+}
+
+/**
+ * Scope db stats (total links / clicks shown on the dashboard) to the current user.
+ */
+yourls_add_filter( 'get_db_stats', 'modern_auth_filter_db_stats', 10, 2 );
+function modern_auth_filter_db_stats( $return, $where ) {
+    $owner = modern_auth_current_owner();
+    if ( $owner === null ) {
+        return [ 'total_links' => 0, 'total_clicks' => 0 ];
+    }
+    $url_table    = YOURLS_DB_TABLE_URL;
+    $owners_table = MODERN_AUTH_OWNERS_TABLE;
+    $sql = "SELECT COUNT(keyword) AS count, SUM(clicks) AS sum FROM `$url_table` WHERE 1=1 "
+         . ( $where['sql'] ?? '' )
+         . " AND `keyword` IN (SELECT `keyword` FROM `$owners_table` WHERE `owner` = :modern_auth_owner)";
+    $binds = ( $where['binds'] ?? [] );
+    $binds['modern_auth_owner'] = $owner;
+    $totals = yourls_get_db('read-modern_auth_db_stats')->fetchObject( $sql, $binds );
+    return [ 'total_links' => (int) $totals->count, 'total_clicks' => (int) ( $totals->sum ?? 0 ) ];
+}
+
+/**
+ * Block deleting a link you don't own (returns 0 rows affected -> ajax reports failure).
+ */
+yourls_add_filter( 'shunt_delete_link_by_keyword', 'modern_auth_guard_delete', 10, 2 );
+function modern_auth_guard_delete( $default, $keyword ) {
+    return modern_auth_owns_keyword( $keyword ) ? $default : 0;
+}
+
+/**
+ * Block saving edits to a link you don't own.
+ */
+yourls_add_filter( 'shunt_edit_link', 'modern_auth_guard_edit', 10, 2 );
+function modern_auth_guard_edit( $default, $keyword ) {
+    if ( modern_auth_owns_keyword( $keyword ) ) {
+        return $default;
+    }
+    return [
+        'status'     => 'fail',
+        'code'       => 'error:owner',
+        'message'    => yourls__( 'You do not own this link.' ),
+        'errorCode'  => '403',
+    ];
+}
+
+/**
+ * Block the inline edit *form* for a link you don't own (it would otherwise reveal the
+ * target URL). Replaces the row HTML with an error notice.
+ */
+yourls_add_filter( 'table_edit_row', 'modern_auth_guard_edit_row', 10, 2 );
+function modern_auth_guard_edit_row( $html, $keyword ) {
+    if ( modern_auth_owns_keyword( $keyword ) ) {
+        return $html;
+    }
+    return '<tr class="edit-row notfound"><td colspan="6" class="edit-row notfound">'
+         . yourls_esc_html__( 'You do not own this link.' ) . '</td></tr>';
+}
+
+/**
+ * Block the per-link stats page (keyword+) for links you don't own. Only applies to logged-in
+ * requests -- anonymous access is already governed by YOURLS_PRIVATE, and public redirects are
+ * never affected (this is the stats page, not the redirect).
+ */
+yourls_add_action( 'pre_yourls_infos', 'modern_auth_guard_infos' );
+function modern_auth_guard_infos( $keyword ) {
+    if ( !defined( 'YOURLS_USER' ) ) {
+        return;
+    }
+    $keyword = is_array( $keyword ) ? ( $keyword[0] ?? '' ) : $keyword;
+    if ( modern_auth_owns_keyword( $keyword ) ) {
+        return;
+    }
+    yourls_redirect( yourls_admin_url( 'index.php' ), 302 );
+    exit;
+}
+
+/**
+ * Scope the "does this long URL already exist" check to the current user's own links, so two
+ * users shortening the same URL each get their own short link instead of being handed (or
+ * blocked by) someone else's. Returning null = "not found for me" -> a new link is created;
+ * returning the row = "you already have one" -> your existing short URL is returned.
+ */
+yourls_add_filter( 'shunt_url_exists', 'modern_auth_scope_url_exists', 10, 2 );
+function modern_auth_scope_url_exists( $default, $url ) {
+    $owner = modern_auth_current_owner();
+    if ( $owner === null ) {
+        return $default; // no user context (eg CLI/install): let core behave normally
+    }
+    $url_table    = YOURLS_DB_TABLE_URL;
+    $owners_table = MODERN_AUTH_OWNERS_TABLE;
+    $row = yourls_get_db('read-modern_auth_url_exists')->fetchObject(
+        "SELECT u.* FROM `$url_table` u
+         INNER JOIN `$owners_table` o ON o.`keyword` = u.`keyword`
+         WHERE u.`url` = :url AND o.`owner` = :owner LIMIT 1",
+        [ 'url' => yourls_sanitize_url( $url ), 'owner' => $owner ]
+    );
+    return ( $row === false ) ? null : $row;
+}
+
+/**
+ * ===========================================================================
+ * Admin capability separation.
+ *
+ * YOURLS core has no roles: anyone who can log into /admin/ has full control,
+ * including managing plugins and tools. With self-registration enabled that
+ * means a regular user could open "Manage Plugins" and DEACTIVATE this very
+ * plugin -- which would silently remove all the ownership isolation above.
+ *
+ * So: restrict the admin-management pages (plugins.php, tools.php) to the
+ * admin account(s) defined in config.php. Regular DB users keep the links
+ * dashboard, their own link management (admin-ajax), and stats for their own
+ * links -- everything they need, nothing that can affect other users or the
+ * plugin. Enforced on 'auth_successful', which fires on every admin page right
+ * after login and before the page acts on the request (including before
+ * plugins.php processes an activate/deactivate), so it blocks the action too,
+ * not just the view.
+ * ===========================================================================
+ */
+
+/**
+ * @return bool whether the current user is an admin defined in config.php (vs a DB user)
+ */
+function modern_auth_is_config_admin() {
+    if ( !defined( 'YOURLS_USER' ) ) {
+        return false;
+    }
+    $admins = array_keys( (array) ( $GLOBALS['yourls_user_passwords'] ?? [] ) );
+    return in_array( (string) YOURLS_USER, $admins, true );
+}
+
+yourls_add_action( 'auth_successful', 'modern_auth_enforce_admin_capability' );
+function modern_auth_enforce_admin_capability() {
+    if ( modern_auth_is_config_admin() ) {
+        return; // config admins keep full access
+    }
+    $script = basename( (string) ( $_SERVER['SCRIPT_NAME'] ?? '' ) );
+    $admin_only = yourls_apply_filter( 'modern_auth_admin_only_scripts', [ 'plugins.php', 'tools.php' ] );
+    if ( in_array( $script, $admin_only, true ) ) {
+        yourls_die(
+            yourls__( 'You do not have permission to access this page.' ),
+            yourls__( 'Access denied' ),
+            403
+        );
+    }
+}
+
+/**
+ * Hide the admin-management menu entries (Tools, Manage Plugins and its sub-pages) from
+ * regular users, so they don't see links they can't use. The auth_successful guard above is
+ * what actually enforces access; this just keeps the menu honest.
+ */
+yourls_add_filter( 'admin_links', 'modern_auth_filter_admin_links' );
+function modern_auth_filter_admin_links( $links ) {
+    if ( modern_auth_is_config_admin() ) {
+        return $links;
+    }
+    unset( $links['tools'], $links['plugins'] );
+    return $links;
+}
+
+yourls_add_filter( 'admin_sublinks', 'modern_auth_filter_admin_sublinks' );
+function modern_auth_filter_admin_sublinks( $sublinks ) {
+    if ( modern_auth_is_config_admin() ) {
+        return $sublinks;
+    }
+    unset( $sublinks['plugins'] );
+    return $sublinks;
 }
