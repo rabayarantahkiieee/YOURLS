@@ -684,3 +684,88 @@ body.reset-password .modern-brand-logo {
     float: none;
     margin: 6vh auto 0;
 }
+
+/* ---------- Status badges (suspended/active) ---------- */
+
+.modern-badge-ok {
+    background: rgba(34, 211, 238, 0.15);
+    border-color: rgba(34, 211, 238, 0.4);
+    color: var(--ma-accent);
+}
+
+.modern-badge-danger {
+    background: rgba(244, 63, 94, 0.18);
+    border-color: rgba(244, 63, 94, 0.5);
+    color: #fca5b1;
+}
+
+/* ---------- Bulk-select toolbar (dashboard + "All Links" moderation page) ---------- */
+
+.modern-bulk-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    margin: 0.75rem 0;
+    padding: 0.6rem 0.9rem;
+    background: var(--ma-surface);
+    border: 1px solid var(--ma-border);
+    border-radius: var(--ma-radius);
+}
+
+.modern-bulk-toolbar select {
+    background: var(--ma-surface-alt);
+    color: var(--ma-text);
+    border: 1px solid var(--ma-border);
+    border-radius: 8px;
+    padding: 0.35rem 0.6rem;
+}
+
+#modern-bulk-count {
+    color: var(--ma-muted);
+    font-size: 0.85rem;
+}
+
+#modern-bulk-delete[disabled] {
+    opacity: 0.45;
+    cursor: not-allowed;
+}
+
+/* ---------- Search & filter panel (core's built-in #filter_form, restyled) ---------- */
+
+#filter_form {
+    float: none;
+    max-width: 100%;
+    background: var(--ma-surface);
+    border: 1px solid var(--ma-border);
+    border-radius: var(--ma-radius);
+    padding: 1rem 1.1rem;
+    margin: 0.5rem 0;
+}
+
+#filter_options {
+    color: var(--ma-muted);
+    line-height: 2.1;
+}
+
+#filter_options input.text,
+#filter_options select {
+    background: var(--ma-surface-alt);
+    color: var(--ma-text);
+    border: 1px solid var(--ma-border);
+    border-radius: 8px;
+    padding: 0.3rem 0.5rem;
+}
+
+#filter_buttons {
+    float: none;
+    margin-top: 0.6rem;
+    display: flex;
+    gap: 0.6rem;
+}
+
+#pagination {
+    float: none;
+    width: auto;
+    text-align: left;
+    margin-top: 0.75rem;
+}

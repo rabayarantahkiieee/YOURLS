@@ -502,6 +502,7 @@ function modern_auth_admin_assets( $context ) {
         echo '<script src="' . yourls_esc_attr( $base . '/assets/vendor/qrcode.js' ) . '"></script>' . "\n";
         echo '<script src="' . yourls_esc_attr( $base . '/assets/vendor/qrcode_UTF8.js' ) . '"></script>' . "\n";
         echo '<script src="' . yourls_esc_attr( $base . '/assets/qr-render.js' ) . '"></script>' . "\n";
+        echo '<script src="' . yourls_esc_attr( $base . '/assets/bulk.js' ) . '"></script>' . "\n";
     }
 }
 
@@ -686,11 +687,14 @@ yourls_add_filter( 'table_head_cells', 'modern_auth_add_table_headers' );
 function modern_auth_add_table_headers( $cells ) {
     $cells['qr']     = yourls__( 'QR Code' );
     $cells['unique'] = yourls__( 'Unique' );
+    $cells['status'] = yourls__( 'Status' );
+    $cells['select'] = '<input type="checkbox" id="modern-select-all" title="' . yourls_esc_attr__( 'Select all' ) . '" />';
     return $cells;
 }
 
 /**
- * Add the matching "QR" and "Unique" cells to every table row, in the same trailing order.
+ * Add the matching "QR", "Unique", "Status" and bulk-select cells to every table row, in the
+ * same trailing order as the headers above.
  */
 yourls_add_filter( 'table_add_row_cell_array', 'modern_auth_add_table_cells' );
 function modern_auth_add_table_cells( $cells, $keyword, $url, $title, $ip, $clicks, $timestamp ) {
@@ -702,7 +706,59 @@ function modern_auth_add_table_cells( $cells, $keyword, $url, $title, $ip, $clic
         'template' => '<span class="modern-badge">%unique%</span>',
         'unique'   => yourls_number_format_i18n( modern_auth_unique_visitors( $keyword ), 0 ),
     ];
+    // Read-only: only the admin can suspend/reactivate a link (see the "All Links" moderation
+    // page). A user sees their own link is suspended so a dead redirect isn't a mystery, but
+    // has no control over it here.
+    $cells['status'] = modern_auth_is_suspended( $keyword )
+        ? [ 'template' => '<span class="modern-badge modern-badge-danger">%s%</span>', 's' => yourls_esc_html__( 'Suspended' ) ]
+        : [ 'template' => '', 's' => '' ];
+    $cells['select'] = [
+        'template' => '<input type="checkbox" class="modern-bulk-select" name="modern_bulk[]" value="%keyword%" />',
+        'keyword'  => yourls_esc_attr( $keyword ),
+    ];
     return $cells;
+}
+
+/**
+ * Small toolbar above the table: select-all + "Delete selected", wired up by assets/bulk.js
+ * against the checkboxes added in modern_auth_add_table_cells() above. Hooked at priority 1 so
+ * it runs (and echoes) before modern_auth_table_buffer_start()'s ob_start() on the same action,
+ * i.e. it's rendered directly, above the buffered <table>, not swallowed into it.
+ */
+yourls_add_action( 'admin_page_before_table', 'modern_auth_bulk_toolbar', 1 );
+function modern_auth_bulk_toolbar() {
+    if ( !yourls_is_admin() ) {
+        return;
+    }
+    $nonce = yourls_create_nonce( 'modern_auth_bulk_delete' );
+    echo '<div class="modern-bulk-toolbar" id="modern-bulk-toolbar">';
+    echo '<span id="modern-bulk-count">' . yourls_esc_html__( '0 selected' ) . '</span>';
+    echo '<button type="button" id="modern-bulk-delete" class="button" disabled>' . yourls_esc_html__( 'Delete selected' ) . '</button>';
+    echo '</div>';
+    echo '<script>window.modernAuthBulkNonce = ' . json_encode( $nonce ) . ';</script>';
+}
+
+/**
+ * AJAX endpoint for the bulk-delete button: admin-ajax.php's default case forwards any unknown
+ * action to do_action('yourls_ajax_'.$action), which is the officially supported extension
+ * point for exactly this. Deletion still goes through yourls_delete_link_by_keyword(), so the
+ * existing ownership guard (modern_auth_guard_delete) applies per keyword -- a user can only
+ * ever bulk-delete their own links, even if the request is tampered with to include someone
+ * else's keyword (that keyword just silently fails and is reported back in "failed").
+ */
+yourls_add_action( 'yourls_ajax_modern_auth_bulk_delete', 'modern_auth_ajax_bulk_delete' );
+function modern_auth_ajax_bulk_delete() {
+    yourls_verify_nonce( 'modern_auth_bulk_delete', $_REQUEST['nonce'] ?? '', false, 'omg error' );
+
+    $keywords = ( isset( $_REQUEST['keywords'] ) && is_array( $_REQUEST['keywords'] ) ) ? $_REQUEST['keywords'] : [];
+    $failed = [];
+    foreach ( $keywords as $keyword ) {
+        $keyword = yourls_sanitize_keyword( (string) $keyword );
+        if ( $keyword === '' || !yourls_delete_link_by_keyword( $keyword ) ) {
+            $failed[] = $keyword;
+        }
+    }
+    echo json_encode( [ 'success' => true, 'failed' => $failed ] );
 }
 
 /**
@@ -817,14 +873,20 @@ function modern_auth_users_page() {
 
 define( 'MODERN_AUTH_OWNERS_TABLE', YOURLS_DB_PREFIX . 'link_owners' );
 
+// Bump this whenever a new migration is added below (eg a new column). The schema-version
+// option is checked BEFORE the one-time backfill-ready flag, so on installs that already ran
+// modern_auth_owners_ready (activated before this version existed), the new column-check migration
+// still runs -- unlike a single ready-flag, which would permanently skip it. Real bug this fixes:
+// suspended/suspended_at were silently never added on any install that had already backfilled.
+define( 'MODERN_AUTH_OWNERS_SCHEMA_VERSION', 2 );
+
 /**
- * Create the ownership table once, and backfill: every pre-existing link that has
- * no owner yet is assigned to the first admin defined in config.php. Uses its own
- * ready-flag so it still runs on installs where the users table already existed.
+ * Create/migrate the ownership table, and (once ever) backfill: every pre-existing link that has
+ * no owner yet is assigned to the first admin defined in config.php.
  */
 yourls_add_action( 'plugins_loaded', 'modern_auth_maybe_create_owners_table' );
 function modern_auth_maybe_create_owners_table() {
-    if ( yourls_get_option( 'modern_auth_owners_ready' ) ) {
+    if ( (int) yourls_get_option( 'modern_auth_owners_schema_version', 0 ) >= MODERN_AUTH_OWNERS_SCHEMA_VERSION ) {
         return;
     }
 
@@ -838,23 +900,32 @@ function modern_auth_maybe_create_owners_table() {
         "CREATE TABLE IF NOT EXISTS `$table` (
             `keyword` VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
             `owner` VARCHAR(190) NOT NULL,
+            `suspended` TINYINT(1) UNSIGNED NOT NULL DEFAULT 0,
+            `suspended_at` DATETIME NULL,
             PRIMARY KEY (`keyword`),
             KEY `owner` (`owner`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
     );
 
-    $admin = modern_auth_first_config_admin();
-    if ( $admin !== null && $admin !== '' ) {
-        $stmt = $pdo->prepare(
-            "INSERT IGNORE INTO `$table` (`keyword`, `owner`)
-             SELECT u.`keyword`, :admin FROM `$url_table` u
-             LEFT JOIN `$table` o ON o.`keyword` = u.`keyword`
-             WHERE o.`keyword` IS NULL"
-        );
-        $stmt->execute( [ 'admin' => $admin ] );
+    // Migration for tables created before the moderation (suspend) feature existed.
+    modern_auth_add_column_if_missing( $pdo, $table, 'suspended', 'TINYINT(1) UNSIGNED NOT NULL DEFAULT 0' );
+    modern_auth_add_column_if_missing( $pdo, $table, 'suspended_at', 'DATETIME NULL' );
+
+    if ( !yourls_get_option( 'modern_auth_owners_ready' ) ) {
+        $admin = modern_auth_first_config_admin();
+        if ( $admin !== null && $admin !== '' ) {
+            $stmt = $pdo->prepare(
+                "INSERT IGNORE INTO `$table` (`keyword`, `owner`)
+                 SELECT u.`keyword`, :admin FROM `$url_table` u
+                 LEFT JOIN `$table` o ON o.`keyword` = u.`keyword`
+                 WHERE o.`keyword` IS NULL"
+            );
+            $stmt->execute( [ 'admin' => $admin ] );
+        }
+        yourls_update_option( 'modern_auth_owners_ready', true );
     }
 
-    yourls_update_option( 'modern_auth_owners_ready', true );
+    yourls_update_option( 'modern_auth_owners_schema_version', MODERN_AUTH_OWNERS_SCHEMA_VERSION );
 }
 
 /**
@@ -953,10 +1024,34 @@ function modern_auth_filter_db_stats( $return, $where ) {
 
 /**
  * Block deleting a link you don't own (returns 0 rows affected -> ajax reports failure).
+ * Admin moderation actions (see "Admin moderation" section below) set
+ * $GLOBALS['modern_auth_moderation_override'] right before calling the core delete function,
+ * so the config-admin can delete ANY link from the "All Links" page, not just their own.
  */
 yourls_add_filter( 'shunt_delete_link_by_keyword', 'modern_auth_guard_delete', 10, 2 );
 function modern_auth_guard_delete( $default, $keyword ) {
+    if ( !empty( $GLOBALS['modern_auth_moderation_override'] ) ) {
+        return $default;
+    }
     return modern_auth_owns_keyword( $keyword ) ? $default : 0;
+}
+
+/**
+ * Whenever a link is actually deleted (by its owner, or by admin moderation), drop its
+ * ownership/suspension row too so the owners table doesn't accumulate orphaned entries.
+ * delete_link fires as do_action('delete_link', $keyword, $delete) -- array-wrapped, as usual.
+ */
+yourls_add_action( 'delete_link', 'modern_auth_cleanup_owner_on_delete' );
+function modern_auth_cleanup_owner_on_delete( $args ) {
+    $keyword = is_array( $args ) ? ( $args[0] ?? '' ) : '';
+    if ( $keyword === '' ) {
+        return;
+    }
+    $table = MODERN_AUTH_OWNERS_TABLE;
+    yourls_get_db('write-modern_auth_cleanup_owner')->fetchAffected(
+        "DELETE FROM `$table` WHERE `keyword` = :keyword",
+        [ 'keyword' => $keyword ]
+    );
 }
 
 /**
@@ -1097,4 +1192,229 @@ function modern_auth_filter_admin_sublinks( $sublinks ) {
     }
     unset( $sublinks['plugins'] );
     return $sublinks;
+}
+
+/**
+ * ===========================================================================
+ * Admin moderation: "All Links".
+ *
+ * Per-user isolation (above) is intentionally total: not even the config
+ * admin sees other users' links on the normal dashboard. But the admin still
+ * needs a way to act on abuse -- a spam or malicious link someone else
+ * created -- without that turning into "admin can browse everyone's links".
+ *
+ * So this is a deliberately narrow, separate capability: a single admin-only
+ * page listing every link with its owner, offering exactly two actions,
+ * suspend and delete. Suspending blocks the public redirect (410) without
+ * touching data; deleting removes the link outright. Both bypass the
+ * ownership guard via $GLOBALS['modern_auth_moderation_override'] (checked
+ * in modern_auth_guard_delete() above), scoped to just this page's request.
+ *
+ * Registered as a plugin page, same mechanism as "Manage Users" -- which
+ * means it's already covered by modern_auth_enforce_admin_capability()
+ * blocking all of plugins.php for non-config-admins, and already hidden
+ * from the menu by modern_auth_filter_admin_sublinks() above.
+ * ===========================================================================
+ */
+
+/**
+ * @param string $keyword
+ * @return bool
+ */
+function modern_auth_is_suspended( string $keyword ): bool {
+    $table = MODERN_AUTH_OWNERS_TABLE;
+    $val = yourls_get_db('read-modern_auth_is_suspended')->fetchValue(
+        "SELECT `suspended` FROM `$table` WHERE `keyword` = :keyword LIMIT 1",
+        [ 'keyword' => yourls_sanitize_keyword( $keyword ) ]
+    );
+    return ( $val !== false && $val !== null && (int) $val === 1 );
+}
+
+/**
+ * Suspend or reactivate a link. Uses an upsert so this still works even for the unlikely edge
+ * case of a link with no owners-table row yet; ON DUPLICATE KEY UPDATE never touches `owner`,
+ * so an existing owner is always preserved.
+ */
+function modern_auth_set_suspended( string $keyword, bool $suspended ): void {
+    $table = MODERN_AUTH_OWNERS_TABLE;
+    yourls_get_db('write-modern_auth_set_suspended')->fetchAffected(
+        "INSERT INTO `$table` (`keyword`, `owner`, `suspended`, `suspended_at`)
+         VALUES (:keyword, '', :suspended, :suspended_at)
+         ON DUPLICATE KEY UPDATE `suspended` = VALUES(`suspended`), `suspended_at` = VALUES(`suspended_at`)",
+        [
+            'keyword'      => yourls_sanitize_keyword( $keyword ),
+            'suspended'    => $suspended ? 1 : 0,
+            'suspended_at' => $suspended ? date( 'Y-m-d H:i:s' ) : null,
+        ]
+    );
+}
+
+/**
+ * Block the public redirect for a suspended link. Hooked on 'load_template_go', which fires in
+ * yourls-loader.php right before it requires yourls-go.php (the file that actually issues the
+ * redirect) -- so this runs early enough to intercept it, for both plain keywords and pages.
+ * Deliberately does NOT touch the stats page (pre_yourls_infos) -- the owner can still see their
+ * own suspended link's stats, just can't have it redirect publicly.
+ */
+yourls_add_action( 'load_template_go', 'modern_auth_block_suspended_redirect' );
+function modern_auth_block_suspended_redirect( $keyword ) {
+    $keyword = is_array( $keyword ) ? ( $keyword[0] ?? '' ) : $keyword;
+    if ( $keyword === '' || !modern_auth_is_suspended( (string) $keyword ) ) {
+        return;
+    }
+    yourls_die(
+        yourls__( 'This link has been suspended by the site administrator and is no longer available.' ),
+        yourls__( 'Link suspended' ),
+        410
+    );
+}
+
+yourls_add_action( 'plugins_loaded', 'modern_auth_register_links_page' );
+function modern_auth_register_links_page() {
+    yourls_register_plugin_page( 'modern_auth_links', yourls__( 'All Links' ), 'modern_auth_links_page' );
+}
+
+function modern_auth_links_page() {
+    // Defense in depth: this page is reached via plugins.php, which the auth_successful guard
+    // already restricts to config admins -- but never render moderation for anyone else.
+    if ( !modern_auth_is_config_admin() ) {
+        yourls_die( yourls__( 'You do not have permission to access this page.' ), yourls__( 'Access denied' ), 403 );
+    }
+
+    $notice   = '';
+    $base_url = yourls_add_query_arg( [ 'page' => 'modern_auth_links' ], yourls_admin_url( 'plugins.php' ) );
+
+    // Single-row action: ?linkaction=suspend|unsuspend|delete&keyword=...&nonce=...
+    if ( isset( $_GET['linkaction'], $_GET['keyword'] ) ) {
+        $linkaction = (string) $_GET['linkaction'];
+        $keyword    = yourls_sanitize_keyword( (string) $_GET['keyword'] );
+        yourls_verify_nonce( 'modern_auth_link_action_' . $linkaction . '_' . $keyword );
+
+        if ( $linkaction === 'suspend' ) {
+            modern_auth_set_suspended( $keyword, true );
+            $notice = '<p class="modern-auth-success">' . yourls_esc_html__( 'Link suspended.' ) . '</p>';
+        } elseif ( $linkaction === 'unsuspend' ) {
+            modern_auth_set_suspended( $keyword, false );
+            $notice = '<p class="modern-auth-success">' . yourls_esc_html__( 'Link reactivated.' ) . '</p>';
+        } elseif ( $linkaction === 'delete' ) {
+            $GLOBALS['modern_auth_moderation_override'] = true;
+            $deleted = yourls_delete_link_by_keyword( $keyword );
+            $GLOBALS['modern_auth_moderation_override'] = false;
+            $notice = $deleted
+                ? '<p class="modern-auth-success">' . yourls_esc_html__( 'Link deleted.' ) . '</p>'
+                : '<p class="error">' . yourls_esc_html__( 'Could not delete link (already removed?).' ) . '</p>';
+        }
+    }
+
+    // Bulk action: POST modern_auth_links_bulk=1, bulk_action, keywords[]
+    if ( !empty( $_POST['modern_auth_links_bulk'] ) ) {
+        yourls_verify_nonce( 'modern_auth_links_bulk' );
+        $bulk_action = (string) ( $_POST['bulk_action'] ?? '' );
+        $keywords    = ( isset( $_POST['keywords'] ) && is_array( $_POST['keywords'] ) ) ? $_POST['keywords'] : [];
+        $count = 0;
+        foreach ( $keywords as $keyword ) {
+            $keyword = yourls_sanitize_keyword( (string) $keyword );
+            if ( $keyword === '' ) {
+                continue;
+            }
+            if ( $bulk_action === 'suspend' ) {
+                modern_auth_set_suspended( $keyword, true );
+                $count++;
+            } elseif ( $bulk_action === 'unsuspend' ) {
+                modern_auth_set_suspended( $keyword, false );
+                $count++;
+            } elseif ( $bulk_action === 'delete' ) {
+                $GLOBALS['modern_auth_moderation_override'] = true;
+                if ( yourls_delete_link_by_keyword( $keyword ) ) {
+                    $count++;
+                }
+                $GLOBALS['modern_auth_moderation_override'] = false;
+            }
+        }
+        $notice = '<p class="modern-auth-success">' . yourls_esc_html( sprintf( yourls__( 'Applied to %d link(s).' ), $count ) ) . '</p>';
+    }
+
+    $url_table    = YOURLS_DB_TABLE_URL;
+    $owners_table = MODERN_AUTH_OWNERS_TABLE;
+    $ydb = yourls_get_db('read-modern_auth_list_links');
+    $links = $ydb->fetchAll(
+        "SELECT u.`keyword`, u.`url`, u.`clicks`, u.`timestamp`, o.`owner`, o.`suspended`
+         FROM `$url_table` u
+         LEFT JOIN `$owners_table` o ON o.`keyword` = u.`keyword`
+         ORDER BY u.`timestamp` DESC
+         LIMIT 300"
+    );
+
+    echo '<h2>' . yourls_esc_html__( 'All links' ) . '</h2>';
+    echo $notice;
+    echo '<p>' . yourls_esc_html__( 'Every link on this server, across all users. Suspend a link to block its public redirect without deleting it, or delete it outright. This view (and these actions) are only available to the admin account(s) defined in config.php -- regular users only ever see and manage their own links.' ) . '</p>';
+
+    if ( count( $links ) >= 300 ) {
+        echo '<p><em>' . yourls_esc_html__( 'Showing the 300 most recent links.' ) . '</em></p>';
+    }
+
+    if ( !$links ) {
+        echo '<p>' . yourls_esc_html__( 'No links yet.' ) . '</p>';
+        return;
+    }
+
+    echo '<form method="post" action="' . yourls_esc_attr( $base_url ) . '">';
+    yourls_nonce_field( 'modern_auth_links_bulk' );
+    echo '<input type="hidden" name="modern_auth_links_bulk" value="1" />';
+
+    echo '<div class="modern-bulk-toolbar">';
+    echo '<select name="bulk_action">';
+    echo '<option value="suspend">' . yourls_esc_html__( 'Suspend selected' ) . '</option>';
+    echo '<option value="unsuspend">' . yourls_esc_html__( 'Reactivate selected' ) . '</option>';
+    echo '<option value="delete">' . yourls_esc_html__( 'Delete selected' ) . '</option>';
+    echo '</select> ';
+    echo '<input type="submit" class="button" value="' . yourls_esc_attr__( 'Apply' ) . '" onclick="return confirm(' . "'" . yourls_esc_js( yourls__( 'Apply this action to all selected links?' ) ) . "'" . ')" />';
+    echo '</div>';
+
+    echo '<div class="modern-card" style="max-width:100%;overflow-x:auto;"><table class="tblSorter" style="width:100%;"><thead><tr>';
+    echo '<th><input type="checkbox" onclick="document.querySelectorAll(\'.modern-links-select\').forEach(function(c){c.checked=this.checked;}, this)" /></th>';
+    echo '<th>' . yourls_esc_html__( 'Short URL' ) . '</th>';
+    echo '<th>' . yourls_esc_html__( 'Destination' ) . '</th>';
+    echo '<th>' . yourls_esc_html__( 'Owner' ) . '</th>';
+    echo '<th>' . yourls_esc_html__( 'Clicks' ) . '</th>';
+    echo '<th>' . yourls_esc_html__( 'Created' ) . '</th>';
+    echo '<th>' . yourls_esc_html__( 'Status' ) . '</th>';
+    echo '<th>' . yourls_esc_html__( 'Actions' ) . '</th>';
+    echo '</tr></thead><tbody>';
+
+    foreach ( $links as $link ) {
+        $keyword   = $link['keyword'];
+        $suspended = !empty( $link['suspended'] );
+        $owner     = ( $link['owner'] !== null && $link['owner'] !== '' ) ? $link['owner'] : yourls__( 'Unknown' );
+
+        $suspend_action = $suspended ? 'unsuspend' : 'suspend';
+        $suspend_label  = $suspended ? yourls__( 'Reactivate' ) : yourls__( 'Suspend' );
+        $suspend_url = yourls_nonce_url(
+            'modern_auth_link_action_' . $suspend_action . '_' . $keyword,
+            yourls_add_query_arg( [ 'linkaction' => $suspend_action, 'keyword' => $keyword ], $base_url )
+        );
+        $delete_url = yourls_nonce_url(
+            'modern_auth_link_action_delete_' . $keyword,
+            yourls_add_query_arg( [ 'linkaction' => 'delete', 'keyword' => $keyword ], $base_url )
+        );
+
+        echo '<tr>';
+        echo '<td><input type="checkbox" class="modern-links-select" name="keywords[]" value="' . yourls_esc_attr( $keyword ) . '" /></td>';
+        echo '<td><a href="' . yourls_esc_attr( yourls_link( $keyword ) ) . '" target="_blank" rel="noopener">' . yourls_esc_html( yourls_link( $keyword ) ) . '</a></td>';
+        echo '<td title="' . yourls_esc_attr( $link['url'] ) . '">' . yourls_esc_html( yourls_trim_long_string( $link['url'], 60 ) ) . '</td>';
+        echo '<td>' . yourls_esc_html( $owner ) . '</td>';
+        echo '<td>' . yourls_number_format_i18n( $link['clicks'] ) . '</td>';
+        echo '<td>' . yourls_esc_html( yourls_date_i18n( yourls_get_datetime_format( yourls__( 'M d, Y H:i' ) ), yourls_get_timestamp( strtotime( $link['timestamp'] ) ) ) ) . '</td>';
+        echo '<td>' . ( $suspended
+            ? '<span class="modern-badge modern-badge-danger">' . yourls_esc_html__( 'Suspended' ) . '</span>'
+            : '<span class="modern-badge modern-badge-ok">' . yourls_esc_html__( 'Active' ) . '</span>' ) . '</td>';
+        echo '<td>';
+        echo '<a href="' . yourls_esc_attr( $suspend_url ) . '" class="button">' . yourls_esc_html( $suspend_label ) . '</a> ';
+        echo '<a href="' . yourls_esc_attr( $delete_url ) . '" class="button" onclick="return confirm(' . "'" . yourls_esc_js( yourls_s( 'Delete link %s? This cannot be undone.', $keyword ) ) . "'" . ')">' . yourls_esc_html__( 'Delete' ) . '</a>';
+        echo '</td>';
+        echo '</tr>';
+    }
+
+    echo '</tbody></table></div>';
+    echo '</form>';
 }
