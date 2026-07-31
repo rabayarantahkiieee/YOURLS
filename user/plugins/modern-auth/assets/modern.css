@@ -769,3 +769,86 @@ body.reset-password .modern-brand-logo {
     text-align: left;
     margin-top: 0.75rem;
 }
+
+/* ---------- Tags (per-link labels + filter) ---------- */
+
+.modern-tags-cell {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.3rem;
+    max-width: 220px;
+}
+
+.modern-tag-pill {
+    display: inline-block;
+    padding: 0.1em 0.55em;
+    border-radius: 999px;
+    background: rgba(34, 211, 238, 0.14);
+    border: 1px solid rgba(34, 211, 238, 0.35);
+    color: var(--ma-text);
+    font-size: 0.78rem;
+    white-space: nowrap;
+}
+
+.modern-tags-edit {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 1.4em;
+    height: 1.4em;
+    border-radius: 999px;
+    border: 1px dashed var(--ma-border);
+    background: transparent;
+    color: var(--ma-muted);
+    cursor: pointer;
+    line-height: 1;
+    font-size: 0.9rem;
+}
+
+.modern-tags-edit:hover {
+    border-color: var(--ma-primary);
+    color: var(--ma-text);
+}
+
+.modern-tags-popup {
+    position: fixed;
+    z-index: 9999;
+    width: 280px;
+    background: var(--ma-surface);
+    border: 1px solid var(--ma-border);
+    border-radius: var(--ma-radius);
+    box-shadow: var(--ma-glow), 0 20px 50px rgba(0, 0, 0, 0.5);
+    padding: 1rem;
+}
+
+.modern-tags-popup-input {
+    width: 100%;
+    box-sizing: border-box;
+    background: var(--ma-surface-alt);
+    color: var(--ma-text);
+    border: 1px solid var(--ma-border);
+    border-radius: 8px;
+    padding: 0.4rem 0.6rem;
+}
+
+.modern-tags-popup-hint {
+    margin-top: 0.4rem;
+    color: var(--ma-muted);
+    font-size: 0.75rem;
+}
+
+.modern-tags-popup-actions {
+    display: flex;
+    gap: 0.5rem;
+    margin-top: 0.75rem;
+}
+
+#modern-tag-filter {
+    flex-wrap: wrap;
+}
+
+#modern-tag-filter label {
+    color: var(--ma-muted);
+    font-size: 0.85rem;
+}

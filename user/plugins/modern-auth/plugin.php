@@ -503,6 +503,7 @@ function modern_auth_admin_assets( $context ) {
         echo '<script src="' . yourls_esc_attr( $base . '/assets/vendor/qrcode_UTF8.js' ) . '"></script>' . "\n";
         echo '<script src="' . yourls_esc_attr( $base . '/assets/qr-render.js' ) . '"></script>' . "\n";
         echo '<script src="' . yourls_esc_attr( $base . '/assets/bulk.js' ) . '"></script>' . "\n";
+        echo '<script src="' . yourls_esc_attr( $base . '/assets/tags.js' ) . '"></script>' . "\n";
     }
 }
 
@@ -688,13 +689,14 @@ function modern_auth_add_table_headers( $cells ) {
     $cells['qr']     = yourls__( 'QR Code' );
     $cells['unique'] = yourls__( 'Unique' );
     $cells['status'] = yourls__( 'Status' );
+    $cells['tags']   = yourls__( 'Tags' );
     $cells['select'] = '<input type="checkbox" id="modern-select-all" title="' . yourls_esc_attr__( 'Select all' ) . '" />';
     return $cells;
 }
 
 /**
- * Add the matching "QR", "Unique", "Status" and bulk-select cells to every table row, in the
- * same trailing order as the headers above.
+ * Add the matching "QR", "Unique", "Status", "Tags" and bulk-select cells to every table row, in
+ * the same trailing order as the headers above.
  */
 yourls_add_filter( 'table_add_row_cell_array', 'modern_auth_add_table_cells' );
 function modern_auth_add_table_cells( $cells, $keyword, $url, $title, $ip, $clicks, $timestamp ) {
@@ -712,6 +714,7 @@ function modern_auth_add_table_cells( $cells, $keyword, $url, $title, $ip, $clic
     $cells['status'] = modern_auth_is_suspended( $keyword )
         ? [ 'template' => '<span class="modern-badge modern-badge-danger">%s%</span>', 's' => yourls_esc_html__( 'Suspended' ) ]
         : [ 'template' => '', 's' => '' ];
+    $cells['tags'] = [ 'template' => '%tags%', 'tags' => modern_auth_render_tags_cell( $keyword ) ];
     $cells['select'] = [
         'template' => '<input type="checkbox" class="modern-bulk-select" name="modern_bulk[]" value="%keyword%" />',
         'keyword'  => yourls_esc_attr( $keyword ),
@@ -929,6 +932,198 @@ function modern_auth_maybe_create_owners_table() {
 }
 
 /**
+ * ===========================================================================
+ * Tags.
+ *
+ * A shared login is often really several people (or several campaigns) using
+ * one account, and t.ly-style free-text tags are how they tell their own
+ * links apart -- eg "kiki twitter" vs "kiki telegram" -- without needing a
+ * separate account per person. Tags are plain strings, many-to-many with a
+ * link (`keyword`, `tag`); no separate "tag catalog" table is needed since
+ * the suggestion list is just the current owner's own distinct tags.
+ *
+ * Scoped implicitly through ownership: a tag row is only ever looked up
+ * together with (or after already having verified) the owning keyword, so
+ * there's no separate per-tag access check to get wrong.
+ * ===========================================================================
+ */
+
+define( 'MODERN_AUTH_TAGS_TABLE', YOURLS_DB_PREFIX . 'link_tags' );
+define( 'MODERN_AUTH_TAGS_SCHEMA_VERSION', 1 );
+
+yourls_add_action( 'plugins_loaded', 'modern_auth_maybe_create_tags_table' );
+function modern_auth_maybe_create_tags_table() {
+    if ( (int) yourls_get_option( 'modern_auth_tags_schema_version', 0 ) >= MODERN_AUTH_TAGS_SCHEMA_VERSION ) {
+        return;
+    }
+
+    $table = MODERN_AUTH_TAGS_TABLE;
+    $pdo = yourls_get_db('write-modern_auth_create_tags')->getPdo();
+    $pdo->exec(
+        "CREATE TABLE IF NOT EXISTS `$table` (
+            `keyword` VARCHAR(100) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin NOT NULL,
+            `tag` VARCHAR(100) NOT NULL,
+            PRIMARY KEY (`keyword`, `tag`),
+            KEY `tag` (`tag`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;"
+    );
+
+    yourls_update_option( 'modern_auth_tags_schema_version', MODERN_AUTH_TAGS_SCHEMA_VERSION );
+}
+
+/**
+ * @param string $keyword
+ * @return string[] tags for this keyword, alphabetically
+ */
+function modern_auth_get_tags_for_keyword( string $keyword ): array {
+    $table = MODERN_AUTH_TAGS_TABLE;
+    return yourls_get_db('read-modern_auth_get_tags')->fetchCol(
+        "SELECT `tag` FROM `$table` WHERE `keyword` = :keyword ORDER BY `tag` ASC",
+        [ 'keyword' => yourls_sanitize_keyword( $keyword ) ]
+    );
+}
+
+/**
+ * @return string[] every distinct tag used across the current user's own links, alphabetically
+ *                   -- the suggestion list for the "add a tag" input and the filter dropdown.
+ */
+function modern_auth_get_user_tags(): array {
+    $owner = modern_auth_current_owner();
+    if ( $owner === null ) {
+        return [];
+    }
+    $tags_table   = MODERN_AUTH_TAGS_TABLE;
+    $owners_table = MODERN_AUTH_OWNERS_TABLE;
+    return yourls_get_db('read-modern_auth_user_tags')->fetchCol(
+        "SELECT DISTINCT t.`tag` FROM `$tags_table` t
+         INNER JOIN `$owners_table` o ON o.`keyword` = t.`keyword`
+         WHERE o.`owner` = :owner ORDER BY t.`tag` ASC",
+        [ 'owner' => $owner ]
+    );
+}
+
+/**
+ * Sanitize and normalize a raw comma-separated tags string from user input: trim, drop empties,
+ * cap length, dedupe case-insensitively (first casing wins), cap count so one link can't
+ * accumulate an unbounded tag list.
+ *
+ * @param string $raw
+ * @return string[]
+ */
+function modern_auth_parse_tags( string $raw ): array {
+    $tags = [];
+    foreach ( explode( ',', $raw ) as $piece ) {
+        $tag = trim( preg_replace( '/\s+/', ' ', $piece ) );
+        if ( $tag === '' ) {
+            continue;
+        }
+        $tag = mb_substr( $tag, 0, 100 );
+        $key = mb_strtolower( $tag );
+        if ( !isset( $tags[ $key ] ) ) {
+            $tags[ $key ] = $tag;
+        }
+        if ( count( $tags ) >= 20 ) {
+            break;
+        }
+    }
+    return array_values( $tags );
+}
+
+/**
+ * Replace the full tag set for a keyword. Caller must already have verified ownership.
+ *
+ * @param string   $keyword
+ * @param string[] $tags
+ */
+function modern_auth_set_tags( string $keyword, array $tags ): void {
+    $keyword = yourls_sanitize_keyword( $keyword );
+    $table = MODERN_AUTH_TAGS_TABLE;
+    $ydb = yourls_get_db('write-modern_auth_set_tags');
+    $ydb->fetchAffected( "DELETE FROM `$table` WHERE `keyword` = :keyword", [ 'keyword' => $keyword ] );
+    foreach ( $tags as $tag ) {
+        $ydb->fetchAffected(
+            "INSERT IGNORE INTO `$table` (`keyword`, `tag`) VALUES (:keyword, :tag)",
+            [ 'keyword' => $keyword, 'tag' => $tag ]
+        );
+    }
+}
+
+/**
+ * Render a link's tags as small pills, plus an "edit" button that assets/tags.js turns into a
+ * popup (same interaction pattern as the QR code popup).
+ */
+function modern_auth_render_tags_cell( string $keyword ): string {
+    $tags  = modern_auth_get_tags_for_keyword( $keyword );
+    $nonce = yourls_create_nonce( 'modern_auth_set_tags_' . $keyword );
+
+    $html = '<div class="modern-tags-cell" data-keyword="' . yourls_esc_attr( $keyword ) . '" data-nonce="' . yourls_esc_attr( $nonce ) . '" data-tags="' . yourls_esc_attr( implode( ', ', $tags ) ) . '">';
+    foreach ( $tags as $tag ) {
+        $html .= '<span class="modern-tag-pill">' . yourls_esc_html( $tag ) . '</span>';
+    }
+    $html .= '<button type="button" class="modern-tags-edit" title="' . yourls_esc_attr__( 'Edit tags' ) . '">+</button>';
+    $html .= '</div>';
+    return $html;
+}
+
+/**
+ * AJAX endpoint (admin-ajax.php?action=modern_auth_set_tags) backing the tags popup. Only the
+ * keyword's owner may retag it -- moderation (admin) doesn't get a bypass here, tags are purely
+ * an organizational tool for the owner, not something that needs admin override.
+ */
+yourls_add_action( 'yourls_ajax_modern_auth_set_tags', 'modern_auth_ajax_set_tags' );
+function modern_auth_ajax_set_tags() {
+    $keyword = yourls_sanitize_keyword( (string) ( $_REQUEST['keyword'] ?? '' ) );
+    yourls_verify_nonce( 'modern_auth_set_tags_' . $keyword, $_REQUEST['nonce'] ?? '', false, 'omg error' );
+
+    if ( $keyword === '' || !modern_auth_owns_keyword( $keyword ) ) {
+        echo json_encode( [ 'success' => false, 'message' => yourls__( 'You do not own this link.' ) ] );
+        return;
+    }
+
+    $tags = modern_auth_parse_tags( (string) ( $_REQUEST['tags'] ?? '' ) );
+    modern_auth_set_tags( $keyword, $tags );
+
+    echo json_encode( [ 'success' => true, 'tags' => $tags, 'html' => modern_auth_render_tags_cell( $keyword ) ] );
+}
+
+/**
+ * Extra filter bar: "Filter by tag" (reads/writes the `modern_tag` query param picked up by
+ * modern_auth_filter_list_by_owner() below) plus the shared <datalist> of the user's own tags
+ * that assets/tags.js points every per-row tag input at. Rendered alongside the bulk toolbar --
+ * same priority-1 hook, so it's outside the buffered <table>.
+ */
+yourls_add_action( 'admin_page_before_table', 'modern_auth_tag_filter_bar', 1 );
+function modern_auth_tag_filter_bar() {
+    if ( !yourls_is_admin() ) {
+        return;
+    }
+    $tags = modern_auth_get_user_tags();
+    if ( !$tags ) {
+        return;
+    }
+    $current = isset( $_GET['modern_tag'] ) ? (string) $_GET['modern_tag'] : '';
+
+    echo '<div class="modern-bulk-toolbar" id="modern-tag-filter">';
+    echo '<label for="modern-tag-select">' . yourls_esc_html__( 'Filter by tag' ) . '</label> ';
+    echo '<select id="modern-tag-select">';
+    echo '<option value="">' . yourls_esc_html__( 'All tags' ) . '</option>';
+    foreach ( $tags as $tag ) {
+        echo '<option value="' . yourls_esc_attr( $tag ) . '"' . ( $tag === $current ? ' selected' : '' ) . '>' . yourls_esc_html( $tag ) . '</option>';
+    }
+    echo '</select>';
+    if ( $current !== '' ) {
+        echo ' <a href="' . yourls_esc_attr( yourls_admin_url( 'index.php' ) ) . '" class="button">' . yourls_esc_html__( 'Clear' ) . '</a>';
+    }
+    echo '</div>';
+
+    echo '<datalist id="modern-tags-datalist">';
+    foreach ( $tags as $tag ) {
+        echo '<option value="' . yourls_esc_attr( $tag ) . '">';
+    }
+    echo '</datalist>';
+}
+
+/**
  * @return string|null first username defined in config.php's $yourls_user_passwords, or null
  */
 function modern_auth_first_config_admin() {
@@ -987,7 +1182,8 @@ function modern_auth_record_owner( $args ) {
 }
 
 /**
- * Restrict the admin links list to the current user's own links.
+ * Restrict the admin links list to the current user's own links, and further to a single tag
+ * when ?modern_tag=... is present (see modern_auth_tag_filter_bar() above).
  */
 yourls_add_filter( 'admin_list_where', 'modern_auth_filter_list_by_owner' );
 function modern_auth_filter_list_by_owner( $where ) {
@@ -999,6 +1195,13 @@ function modern_auth_filter_list_by_owner( $where ) {
     $table = MODERN_AUTH_OWNERS_TABLE;
     $where['sql'] .= " AND `keyword` IN (SELECT `keyword` FROM `$table` WHERE `owner` = :modern_auth_owner)";
     $where['binds']['modern_auth_owner'] = $owner;
+
+    if ( !empty( $_GET['modern_tag'] ) ) {
+        $tags_table = MODERN_AUTH_TAGS_TABLE;
+        $where['sql'] .= " AND `keyword` IN (SELECT `keyword` FROM `$tags_table` WHERE `tag` = :modern_auth_tag)";
+        $where['binds']['modern_auth_tag'] = mb_substr( (string) $_GET['modern_tag'], 0, 100 );
+    }
+
     return $where;
 }
 
@@ -1038,7 +1241,7 @@ function modern_auth_guard_delete( $default, $keyword ) {
 
 /**
  * Whenever a link is actually deleted (by its owner, or by admin moderation), drop its
- * ownership/suspension row too so the owners table doesn't accumulate orphaned entries.
+ * ownership/suspension AND tags rows too so neither table accumulates orphaned entries.
  * delete_link fires as do_action('delete_link', $keyword, $delete) -- array-wrapped, as usual.
  */
 yourls_add_action( 'delete_link', 'modern_auth_cleanup_owner_on_delete' );
@@ -1047,6 +1250,11 @@ function modern_auth_cleanup_owner_on_delete( $args ) {
     if ( $keyword === '' ) {
         return;
     }
+    $tags_table = MODERN_AUTH_TAGS_TABLE;
+    yourls_get_db('write-modern_auth_cleanup_tags')->fetchAffected(
+        "DELETE FROM `$tags_table` WHERE `keyword` = :keyword",
+        [ 'keyword' => $keyword ]
+    );
     $table = MODERN_AUTH_OWNERS_TABLE;
     yourls_get_db('write-modern_auth_cleanup_owner')->fetchAffected(
         "DELETE FROM `$table` WHERE `keyword` = :keyword",
@@ -1372,6 +1580,7 @@ function modern_auth_links_page() {
     echo '<th>' . yourls_esc_html__( 'Short URL' ) . '</th>';
     echo '<th>' . yourls_esc_html__( 'Destination' ) . '</th>';
     echo '<th>' . yourls_esc_html__( 'Owner' ) . '</th>';
+    echo '<th>' . yourls_esc_html__( 'Tags' ) . '</th>';
     echo '<th>' . yourls_esc_html__( 'Clicks' ) . '</th>';
     echo '<th>' . yourls_esc_html__( 'Created' ) . '</th>';
     echo '<th>' . yourls_esc_html__( 'Status' ) . '</th>';
@@ -1399,6 +1608,10 @@ function modern_auth_links_page() {
         echo '<td><a href="' . yourls_esc_attr( yourls_link( $keyword ) ) . '" target="_blank" rel="noopener">' . yourls_esc_html( yourls_link( $keyword ) ) . '</a></td>';
         echo '<td title="' . yourls_esc_attr( $link['url'] ) . '">' . yourls_esc_html( yourls_trim_long_string( $link['url'], 60 ) ) . '</td>';
         echo '<td>' . yourls_esc_html( $owner ) . '</td>';
+        $tags = modern_auth_get_tags_for_keyword( $keyword );
+        echo '<td>' . ( $tags ? implode( ' ', array_map( static function ( $tag ) {
+            return '<span class="modern-tag-pill">' . yourls_esc_html( $tag ) . '</span>';
+        }, $tags ) ) : '' ) . '</td>';
         echo '<td>' . yourls_number_format_i18n( $link['clicks'] ) . '</td>';
         echo '<td>' . yourls_esc_html( yourls_date_i18n( yourls_get_datetime_format( yourls__( 'M d, Y H:i' ) ), yourls_get_timestamp( strtotime( $link['timestamp'] ) ) ) ) . '</td>';
         echo '<td>' . ( $suspended
