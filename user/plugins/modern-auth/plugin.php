@@ -505,6 +505,10 @@ function modern_auth_admin_assets( $context ) {
         echo '<script src="' . yourls_esc_attr( $base . '/assets/bulk.js' ) . '"></script>' . "\n";
         echo '<script src="' . yourls_esc_attr( $base . '/assets/tags.js' ) . '"></script>' . "\n";
     }
+
+    if ( $context === 'infos' ) {
+        echo '<script src="' . yourls_esc_attr( $base . '/assets/analytics.js' ) . '"></script>' . "\n";
+    }
 }
 
 /**
@@ -1626,4 +1630,252 @@ function modern_auth_links_page() {
 
     echo '</tbody></table></div>';
     echo '</form>';
+}
+
+/**
+ * ===========================================================================
+ * Advanced analytics: city-level location, device/browser breakdown, and a
+ * searchable "Cities" table on each link's stats page (yourls-infos.php).
+ *
+ * City lookups need a GeoLite2-City.mmdb database. Unlike the country-level
+ * DB core already bundles (includes/geo/GeoLite2-Country.mmdb), MaxMind's
+ * policy since Dec 2019 requires a free personal account + license key for
+ * it, so it can't just be bundled the same way -- docker-entrypoint.sh
+ * downloads it into geo/GeoLite2-City.mmdb at container start when
+ * MAXMIND_LICENSE_KEY is set. If it's missing, the Cities section says so
+ * plainly instead of silently doing nothing; everything else on the stats
+ * page (including device/browser, which needs no extra setup) is
+ * unaffected. Reuses core's already-vendored geoip2 reader library
+ * (includes/vendor/geoip2), same one core's own country lookup uses.
+ *
+ * Ownership is already enforced by modern_auth_guard_infos() (hooked on
+ * 'pre_yourls_infos', which fires before any of this) -- by the time these
+ * hooks run, either the request is anonymous under a public install, or the
+ * current user has already been confirmed to own this keyword.
+ * ===========================================================================
+ */
+
+function modern_auth_geo_city_db_path(): string {
+    return (string) yourls_apply_filter( 'modern_auth_geo_city_db_path', __DIR__ . '/geo/GeoLite2-City.mmdb' );
+}
+
+/**
+ * @return \GeoIp2\Database\Reader|null cached reader, or null if the City DB isn't set up
+ */
+function modern_auth_geo_city_reader() {
+    static $reader = null;
+    static $tried = false;
+    if ( $tried ) {
+        return $reader;
+    }
+    $tried = true;
+
+    $path = modern_auth_geo_city_db_path();
+    if ( !is_readable( $path ) ) {
+        return null;
+    }
+    try {
+        $reader = new \GeoIp2\Database\Reader( $path );
+    } catch ( \Exception $e ) {
+        $reader = null;
+    }
+    return $reader;
+}
+
+/**
+ * @param string $ip
+ * @return array{city:string,subdivision:string,country:string}|null
+ */
+function modern_auth_ip_to_city( string $ip ) {
+    $reader = modern_auth_geo_city_reader();
+    if ( !$reader ) {
+        return null;
+    }
+    try {
+        $record = $reader->city( $ip );
+        return [
+            'city'        => (string) ( $record->city->name ?? '' ),
+            'subdivision' => (string) ( $record->mostSpecificSubdivision->name ?? '' ),
+            'country'     => (string) ( $record->country->isoCode ?? '' ),
+        ];
+    } catch ( \Exception $e ) {
+        return null;
+    }
+}
+
+/**
+ * Lightweight heuristic User-Agent classifier: coarse device type + browser name from
+ * the raw string already stored per click. This is deliberately approximate (real UA
+ * parsing is inherently fuzzy, browsers spoof each other's tokens on purpose) -- good
+ * enough for a rough breakdown, not meant to be forensically precise.
+ *
+ * @param string $ua
+ * @return array{device:string,browser:string}
+ */
+function modern_auth_parse_user_agent( string $ua ): array {
+    if ( trim( $ua ) === '' ) {
+        return [ 'device' => yourls__( 'Unknown' ), 'browser' => yourls__( 'Unknown' ) ];
+    }
+
+    if ( preg_match( '/bot|crawl|spider|slurp|facebookexternalhit|whatsapp|telegrambot|bingpreview/i', $ua ) ) {
+        $device = yourls__( 'Bot' );
+    } elseif ( preg_match( '/ipad|tablet(?!.*mobile)|kindle|playbook|nexus (7|9|10)/i', $ua ) ) {
+        $device = yourls__( 'Tablet' );
+    } elseif ( preg_match( '/mobi|iphone|ipod|android.*mobile|blackberry|windows phone/i', $ua ) ) {
+        $device = yourls__( 'Mobile' );
+    } else {
+        $device = yourls__( 'Desktop' );
+    }
+
+    $ua_l = strtolower( $ua );
+    if ( strpos( $ua_l, 'edg/' ) !== false || strpos( $ua_l, 'edge' ) !== false ) {
+        $browser = 'Edge';
+    } elseif ( strpos( $ua_l, 'opr/' ) !== false || strpos( $ua_l, 'opera' ) !== false ) {
+        $browser = 'Opera';
+    } elseif ( strpos( $ua_l, 'firefox' ) !== false ) {
+        $browser = 'Firefox';
+    } elseif ( strpos( $ua_l, 'chrome' ) !== false || strpos( $ua_l, 'crios' ) !== false ) {
+        $browser = 'Chrome';
+    } elseif ( strpos( $ua_l, 'safari' ) !== false ) {
+        $browser = 'Safari';
+    } else {
+        $browser = yourls__( 'Other' );
+    }
+
+    return [ 'device' => $device, 'browser' => $browser ];
+}
+
+/**
+ * Render a simple label + horizontal-bar + count/percentage breakdown -- used for both
+ * the Devices and Platform (browser) cards. No chart library needed.
+ */
+function modern_auth_render_breakdown_bars( array $data, int $total ): string {
+    if ( $total <= 0 || !$data ) {
+        return '<p>' . yourls_esc_html__( 'No data yet.' ) . '</p>';
+    }
+    $html = '<div class="modern-breakdown">';
+    foreach ( $data as $label => $count ) {
+        $pct = (int) round( ( $count / $total ) * 100 );
+        $html .= '<div class="modern-breakdown-row">';
+        $html .= '<span class="modern-breakdown-label">' . yourls_esc_html( (string) $label ) . '</span>';
+        $html .= '<span class="modern-breakdown-bar"><span style="width:' . $pct . '%"></span></span>';
+        $html .= '<span class="modern-breakdown-value">' . yourls_number_format_i18n( $count ) . ' (' . $pct . '%)</span>';
+        $html .= '</div>';
+    }
+    $html .= '</div>';
+    return $html;
+}
+
+/**
+ * "Cities" card in the Traffic location tab: a searchable, country-filterable table of
+ * cities resolved from this link's distinct visitor IPs. Hooked on 'pre_yourls_info_location'
+ * (fires unconditionally whenever the tab exists) rather than 'post_yourls_info_location'
+ * (which core only fires when its own country-level $countries array is non-empty) -- a
+ * link can have clicks with no *country* ever resolved (eg all from local/private IPs in
+ * testing) while still legitimately having nothing to show here, and this card computes
+ * its own data independently of core's $countries anyway.
+ */
+yourls_add_action( 'pre_yourls_info_location', 'modern_auth_render_cities_section' );
+function modern_auth_render_cities_section( $keyword ) {
+    $keyword = is_array( $keyword ) ? ( $keyword[0] ?? '' ) : $keyword;
+    if ( $keyword === '' ) {
+        return;
+    }
+
+    echo '<div class="modern-card modern-analytics-card"><h3>' . yourls_esc_html__( 'Cities' ) . '</h3>';
+
+    if ( !modern_auth_geo_city_reader() ) {
+        echo '<p class="modern-analytics-hint">' . yourls_esc_html__( 'City-level data isn\'t set up on this server. Set the MAXMIND_LICENSE_KEY environment variable to enable it (see .env.example).' ) . '</p></div>';
+        return;
+    }
+
+    $table = YOURLS_DB_TABLE_LOG;
+    $rows = yourls_get_db('read-modern_auth_city_ips')->fetchAll(
+        "SELECT `ip_address`, COUNT(*) AS `count` FROM `$table` WHERE `shorturl` = :keyword GROUP BY `ip_address`",
+        [ 'keyword' => $keyword ]
+    );
+
+    $cities = [];
+    foreach ( $rows as $row ) {
+        $loc = modern_auth_ip_to_city( (string) $row['ip_address'] );
+        if ( !$loc || $loc['city'] === '' ) {
+            continue;
+        }
+        $key = $loc['city'] . '|' . $loc['subdivision'] . '|' . $loc['country'];
+        if ( !isset( $cities[ $key ] ) ) {
+            $cities[ $key ] = [ 'city' => $loc['city'], 'subdivision' => $loc['subdivision'], 'country' => $loc['country'], 'count' => 0 ];
+        }
+        $cities[ $key ]['count'] += (int) $row['count'];
+    }
+
+    if ( !$cities ) {
+        echo '<p>' . yourls_esc_html__( 'No city data for this link yet.' ) . '</p></div>';
+        return;
+    }
+
+    uasort( $cities, static function ( $a, $b ) { return $b['count'] <=> $a['count']; } );
+    $countries = array_values( array_unique( array_filter( array_column( $cities, 'country' ) ) ) );
+    sort( $countries );
+
+    echo '<div class="modern-analytics-filters">';
+    echo '<input type="text" id="modern-city-search" placeholder="' . yourls_esc_attr__( 'Search city...' ) . '" />';
+    echo '<select id="modern-city-country"><option value="">' . yourls_esc_html__( 'All countries' ) . '</option>';
+    foreach ( $countries as $code ) {
+        echo '<option value="' . yourls_esc_attr( $code ) . '">' . yourls_esc_html( yourls_geo_countrycode_to_countryname( $code ) ?: $code ) . '</option>';
+    }
+    echo '</select></div>';
+
+    echo '<table class="tblSorter modern-city-table" id="modern-city-table" style="width:100%;"><thead><tr>';
+    echo '<th>' . yourls_esc_html__( 'City' ) . '</th>';
+    echo '<th>' . yourls_esc_html__( 'Region' ) . '</th>';
+    echo '<th>' . yourls_esc_html__( 'Country' ) . '</th>';
+    echo '<th>' . yourls_esc_html__( 'Clicks' ) . '</th>';
+    echo '</tr></thead><tbody>';
+    foreach ( $cities as $c ) {
+        echo '<tr data-country="' . yourls_esc_attr( $c['country'] ) . '">';
+        echo '<td>' . yourls_esc_html( $c['city'] ) . '</td>';
+        echo '<td>' . yourls_esc_html( $c['subdivision'] ) . '</td>';
+        echo '<td>' . yourls_esc_html( yourls_geo_countrycode_to_countryname( $c['country'] ) ?: $c['country'] ) . '</td>';
+        echo '<td>' . yourls_number_format_i18n( $c['count'] ) . '</td>';
+        echo '</tr>';
+    }
+    echo '</tbody></table></div>';
+}
+
+/**
+ * "Devices" and "Platform (browser)" cards in the Traffic statistics tab, parsed from
+ * this link's distinct user_agent strings (grouped in SQL, parsed once per distinct
+ * value rather than once per click).
+ */
+yourls_add_action( 'post_yourls_info_stats', 'modern_auth_render_device_section' );
+function modern_auth_render_device_section( $keyword ) {
+    $keyword = is_array( $keyword ) ? ( $keyword[0] ?? '' ) : $keyword;
+    if ( $keyword === '' ) {
+        return;
+    }
+
+    $table = YOURLS_DB_TABLE_LOG;
+    $rows = yourls_get_db('read-modern_auth_ua_breakdown')->fetchAll(
+        "SELECT `user_agent`, COUNT(*) AS `count` FROM `$table` WHERE `shorturl` = :keyword GROUP BY `user_agent`",
+        [ 'keyword' => $keyword ]
+    );
+    if ( !$rows ) {
+        return;
+    }
+
+    $devices = [];
+    $browsers = [];
+    $total = 0;
+    foreach ( $rows as $row ) {
+        $parsed = modern_auth_parse_user_agent( (string) $row['user_agent'] );
+        $count = (int) $row['count'];
+        $devices[ $parsed['device'] ]   = ( $devices[ $parsed['device'] ] ?? 0 ) + $count;
+        $browsers[ $parsed['browser'] ] = ( $browsers[ $parsed['browser'] ] ?? 0 ) + $count;
+        $total += $count;
+    }
+    arsort( $devices );
+    arsort( $browsers );
+
+    echo '<div class="modern-card modern-analytics-card"><h3>' . yourls_esc_html__( 'Devices' ) . '</h3>' . modern_auth_render_breakdown_bars( $devices, $total ) . '</div>';
+    echo '<div class="modern-card modern-analytics-card"><h3>' . yourls_esc_html__( 'Platform (browser)' ) . '</h3>' . modern_auth_render_breakdown_bars( $browsers, $total ) . '</div>';
 }

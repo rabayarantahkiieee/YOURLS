@@ -8,7 +8,9 @@ RUN composer install --no-dev --no-scripts --no-interaction --optimize-autoloade
 # ---- Stage 2: runtime image ----
 FROM php:8.3-apache
 
-RUN docker-php-ext-install pdo_mysql opcache \
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && docker-php-ext-install pdo_mysql opcache \
     && a2enmod rewrite \
     && echo "ServerName localhost" >> /etc/apache2/apache2.conf \
     && rm -rf /var/lib/apt/lists/*
@@ -107,6 +109,32 @@ fi
 PORT="${PORT:-80}"
 sed -i "s/^Listen .*/Listen ${PORT}/" /etc/apache2/ports.conf
 sed -i "s/<VirtualHost \*:[0-9]*>/<VirtualHost *:${PORT}>/" /etc/apache2/sites-enabled/000-default.conf
+
+# City-level geolocation (the "Cities" breakdown on each link's stats page) needs a
+# GeoLite2-City database. Unlike the country-level DB already bundled in this image,
+# MaxMind requires a free personal account and license key for it (their policy since
+# Dec 2019 -- it can't just be redistributed). Downloaded once per container lifetime
+# if a key is provided; a missing/failed download is a soft no-op, not a startup failure
+# -- the plugin just says city data isn't configured and everything else keeps working.
+GEO_CITY_DB=/var/www/html/user/plugins/modern-auth/geo/GeoLite2-City.mmdb
+if [ -n "$MAXMIND_LICENSE_KEY" ] && [ ! -f "$GEO_CITY_DB" ]; then
+    mkdir -p "$(dirname "$GEO_CITY_DB")"
+    TMP_TAR=/tmp/geolite2-city.tar.gz
+    if curl -fsSL "https://download.maxmind.com/app/geoip_download?edition_id=GeoLite2-City&license_key=${MAXMIND_LICENSE_KEY}&suffix=tar.gz" -o "$TMP_TAR"; then
+        TMP_DIR=$(mktemp -d)
+        tar -xzf "$TMP_TAR" -C "$TMP_DIR" 2>/dev/null || true
+        FOUND=$(find "$TMP_DIR" -name '*.mmdb' | head -n1)
+        if [ -n "$FOUND" ]; then
+            mv "$FOUND" "$GEO_CITY_DB"
+            chown www-data:www-data "$GEO_CITY_DB"
+        else
+            echo "GeoLite2-City download did not contain an .mmdb file, skipping (check MAXMIND_LICENSE_KEY)" >&2
+        fi
+        rm -rf "$TMP_DIR" "$TMP_TAR"
+    else
+        echo "Could not download GeoLite2-City (check MAXMIND_LICENSE_KEY), city-level stats will be unavailable" >&2
+    fi
+fi
 
 exec "$@"
 EOF
