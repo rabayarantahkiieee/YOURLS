@@ -1102,26 +1102,22 @@ function modern_auth_guard_infos( $keyword ) {
 }
 
 /**
- * Scope the "does this long URL already exist" check to the current user's own links, so two
- * users shortening the same URL each get their own short link instead of being handed (or
- * blocked by) someone else's. Returning null = "not found for me" -> a new link is created;
- * returning the row = "you already have one" -> your existing short URL is returned.
+ * Never treat a URL as "already shortened" for a logged-in user -- always let them create a new
+ * short link for it, even one they've shortened before. This is what makes it possible to make
+ * several short links for the same destination on purpose, eg one per channel (a Facebook post,
+ * a tweet, a newsletter) so clicks from each can be told apart in the stats. Core's own
+ * duplicate-URL prevention (YOURLS_UNIQUE_URLS) assumes a single owner for the whole site; under
+ * per-user isolation that would only ever compare a link against the current user's own past
+ * links anyway, so disabling it here (rather than telling every site owner to also flip
+ * YOURLS_UNIQUE_URLS to false in config.php) is the more faithful fix. No-user contexts (eg CLI,
+ * install) are unaffected -- $default proceeds as core would run it.
  */
 yourls_add_filter( 'shunt_url_exists', 'modern_auth_scope_url_exists', 10, 2 );
 function modern_auth_scope_url_exists( $default, $url ) {
-    $owner = modern_auth_current_owner();
-    if ( $owner === null ) {
+    if ( modern_auth_current_owner() === null ) {
         return $default; // no user context (eg CLI/install): let core behave normally
     }
-    $url_table    = YOURLS_DB_TABLE_URL;
-    $owners_table = MODERN_AUTH_OWNERS_TABLE;
-    $row = yourls_get_db('read-modern_auth_url_exists')->fetchObject(
-        "SELECT u.* FROM `$url_table` u
-         INNER JOIN `$owners_table` o ON o.`keyword` = u.`keyword`
-         WHERE u.`url` = :url AND o.`owner` = :owner LIMIT 1",
-        [ 'url' => yourls_sanitize_url( $url ), 'owner' => $owner ]
-    );
-    return ( $row === false ) ? null : $row;
+    return null; // "not found" -> yourls_add_new_link() always creates a new short link
 }
 
 /**
